@@ -4,7 +4,7 @@ import { HopApi } from "../api.js";
 import { makeAPIRequest } from "../util.js";
 import { compileRequestSchema, compileResponseSchema } from "../types/api.js";
 import { Trade } from "../types/trade.js";
-import { normalizeStructTag, toB64 } from "@mysten/sui/utils";
+import { toB64 } from "@mysten/sui/utils";
 
 export interface GetTxParams {
   trade: Trade;
@@ -23,6 +23,7 @@ export interface GetTxParams {
 
 export interface GetTxResponse {
   transaction: Transaction;
+  tx_raw: string,
   output_coin: TransactionResult | undefined;
 }
 
@@ -96,6 +97,7 @@ export async function fetchTx(
         `HopApi > Error: sui address ${params.sui_address} does not have any input coins for tx.`,
       );
     }
+    console.log(user_input_coins)
     let total_input = user_input_coins.reduce((c, t) => c + BigInt(t.amount), 0n);
     if (total_input < params.trade.amount_in.amount) {
       throw new Error(
@@ -104,19 +106,19 @@ export async function fetchTx(
       Trade amount: ${params.trade.amount_in.amount}`
       )
     }
-  }
 
-  // gas coins
-  if(!params.sponsored) {
-    if (normalizeStructTag(params.trade.amount_in.token) != normalizeStructTag("0x2::sui::SUI") || user_input_coins.length == 0) {
-      let fetched_gas_coins = await fetchCoins(
-        client,
-        params.sui_address,
-        "0x2::sui::SUI",
-      );
-      gas_coins = fetched_gas_coins.filter((struct) => Number(struct.amount) > 0).map((struct) => struct.object_id);
-    } else {
-      gas_coins = user_input_coins.filter((struct) => Number(struct.amount) > 0).map((struct) => struct.object_id);
+    // gas coins
+    if(!params.sponsored) {
+      if (params.trade.amount_in.token != "0x2::sui::SUI") {
+        let fetched_gas_coins = await fetchCoins(
+          client,
+          params.sui_address,
+          "0x2::sui::SUI",
+        );
+        gas_coins = fetched_gas_coins.filter((struct) => struct.amount != "0").map((struct) => struct.object_id);
+      } else {
+        gas_coins = user_input_coins.filter((struct) => struct.amount != "0").map((struct) => struct.object_id);
+      }
     }
   }
 
@@ -131,6 +133,8 @@ export async function fetchTx(
     user_input_coins.push(...single_output_coin);
   }
 
+  console.log(params.input_coin_argument)
+
   if (!params.sponsored && gas_coins.length === 0) {
     throw new Error(
       `HopApi > Error: sui address ${params.sui_address} does not have any gas coins for tx.`,
@@ -141,19 +145,11 @@ export async function fetchTx(
     throw new Error("Input coin argument must be result from base transaction!");
   }
 
-  let input_coin_argument = undefined;
-  let input_coin_argument_nested = undefined;
-
-  // @ts-expect-error
-  if(params.input_coin_argument?.$kind === "Result" || params.input_coin_argument?.Result) {
-    // @ts-expect-error
-    input_coin_argument = params?.input_coin_argument?.Result;
-    // @ts-expect-error
-  } else if(params.input_coin_argument?.$kind === "NestedResult" || params.input_coin_argument?.NestedResult) {
-    // @ts-expect-error
-    input_coin_argument_nested = params?.input_coin_argument?.NestedResult;
+  if(params.input_coin_argument && (params.input_coin_argument.$kind !== "Result" || !params.input_coin_argument.Result)) {
+    throw new Error("Input coin argument must b rundeve of $kind 'Result'!");
   }
 
+  const input_coin_argument = params?.input_coin_argument?.Result;
   let base_transaction = undefined;
 
   if(params.base_transaction) {
@@ -182,10 +178,11 @@ export async function fetchTx(
       base_transaction,
 
       input_coin_argument,
-      input_coin_argument_nested,
       return_output_coin_argument: !!params.return_output_coin_argument,
     },
   });
+
+  console.log(compileRequest)
 
   const response = await makeAPIRequest({
     route: "tx/compile",
@@ -198,8 +195,11 @@ export async function fetchTx(
     responseSchema: compileResponseSchema,
   });
 
+  console.log(response)
+
   if (response.tx) {
     const tx_block = createFrontendTxBlock(response.tx);
+    console.log('block: ', tx_block)
     let output_coin: TransactionResult | undefined = undefined;
 
     if(params.return_output_coin_argument) {
@@ -207,19 +207,24 @@ export async function fetchTx(
       // last merge into final output coin
       // slippage check
       // fee
-      // @ts-ignore
-      output_coin = tx_block
-        .getData()
-        .commands.find(
-          (tx) =>
-            tx.$kind == "MoveCall" &&
-            tx.MoveCall.function === "check_slippage_v2" &&
-            tx.MoveCall.module === "slippage",
-        )?.MoveCall.arguments[0];
+      if(client.options.fee_wallet != undefined) {
+        // @ts-ignore
+        output_coin = tx_block
+          .getData()
+          .commands.find(
+            (tx) =>
+              tx.$kind == "MoveCall" &&
+              tx.MoveCall.function === "check_slippage_v2" &&
+              tx.MoveCall.module === "slippage",
+          )?.MoveCall.arguments[0];
+      } else {
+        throw new Error("Fees must be enabled for output coin to be returned!");
+      }
     }
 
     return {
       transaction: tx_block,
+      tx_raw: response.tx,
       output_coin,
     };
   }
@@ -257,6 +262,7 @@ const createFrontendTxBlock = (serialized: string): Transaction => {
     }
     return input;
   });
+  console.log(newInputs)
 
   return Transaction.from(
     JSON.stringify({
